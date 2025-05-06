@@ -11,6 +11,7 @@ import json
 import os
 import re
 from copy import deepcopy
+from typing import Optional
 
 import numpy as np
 import torch
@@ -26,28 +27,22 @@ from ..agent import Agent
 from . import models
 from .utils import CriticDataset, adaptive_scheduler, grad_norm, policy_kl, soft_update
 
+from docbrown.templates.warp_env import RolloutTrajectory, WarpEnv
 
 class SHAC(Agent):
     r"""Short-Horizon Actor-Critic."""
 
     def __init__(self, full_cfg, **kwargs):
-        self.network_config = full_cfg.agent.network
-        self.shac_config = full_cfg.agent.shac
-        self.num_actors = self.shac_config.num_actors
+        self._env = None
+        self.network_config = full_cfg.network
+        self.shac_config = full_cfg.shac
         self.max_agent_steps = int(self.shac_config.max_agent_steps)
         super().__init__(full_cfg, **kwargs)
-
-        self.num_envs = self.env.num_envs
-        self.num_obs = self.env.num_obs
-        self.num_actions = self.env.num_actions
-        self.max_episode_length = self.env.max_episode_length
 
         # --- SAPO Parameters ---
         self.with_logprobs = self.shac_config.get('with_logprobs', False)
         self.with_autoent = self.shac_config.get('with_autoent', False)
         self.entropy_coef = self.shac_config.get('entropy_coef', None)
-        self.offset_by_target_entropy = self.shac_config.get('offset_by_target_entropy', False)
-        self.scale_by_target_entropy = self.shac_config.get('scale_by_target_entropy', False)
         self.unscale_entropy_alpha = self.shac_config.get('unscale_entropy_alpha', False)
         self.use_distr_ent = self.shac_config.get('use_distr_ent', False)
         self.entropy_in_return = self.shac_config.get('entropy_in_return', False)
@@ -64,32 +59,11 @@ class SHAC(Agent):
         self.critic_method = self.shac_config.get('critic_method', 'one-step')  # ['one-step', 'td-lambda']
         if self.critic_method == 'td-lambda':
             self.lam = self.shac_config.get('lambda', 0.95)
-        self.critic_iterations = self.shac_config.get('critic_iterations', 16)
+        self.critic_iterations = self.shac_config.get('critic_iterations', 16)  # Called mini-epoch in their paper
         self.target_critic_alpha = self.shac_config.get('target_critic_alpha', 0.4)
 
-        self.horizon_len = self.shac_config.horizon_len
         self.max_epochs = self.shac_config.get('max_epochs', 0)  # set to 0 to disable and track by max_agent_steps instead
         self.num_critic_batches = self.shac_config.get('num_critic_batches', 4)
-        self.critic_batch_size = self.num_envs * self.horizon_len // self.num_critic_batches
-        print('Critic batch size:', self.critic_batch_size)
-
-        # --- Normalizers ---
-        if self.tanh_clamp:  # legacy
-            # unbiased=False -> correction=0
-            # https://github.com/NVlabs/DiffRL/blob/a4c0dd1696d3c3b885ce85a3cb64370b580cb913/utils/running_mean_std.py#L34
-            rms_config = dict(eps=1e-5, correction=0, initial_count=1e-4, dtype=torch.float32)
-        else:
-            rms_config = dict(eps=1e-5, initial_count=1, dtype=torch.float64)
-        if self.normalize_input:
-            self.obs_rms = {}
-            for k, v in self.obs_space.items():
-                if re.match(self.obs_rms_keys, k):
-                    self.obs_rms[k] = normalizers.RunningMeanStd(v, **rms_config)
-                else:
-                    self.obs_rms[k] = normalizers.Identity()
-            self.obs_rms = nn.ModuleDict(self.obs_rms).to(self.device)
-        else:
-            self.obs_rms = None
 
         # --- Encoder ---
         if self.network_config.get("encoder", None) is not None:
@@ -97,7 +71,7 @@ class SHAC(Agent):
             encoder_kwargs = self.network_config.get("encoder_kwargs", {})
             self.encoder = EncoderCls(self.obs_space, encoder_kwargs, weight_init_fn=models.weight_init_)
         else:
-            f = lambda x: x['obs']
+            f = lambda x: x
             self.encoder = nets.Lambda(f)
         self.encoder.to(self.device)
         print('Encoder:', self.encoder)
@@ -110,6 +84,67 @@ class SHAC(Agent):
             self.actor_encoder = deepcopy(self.encoder)
             print('Actor Encoder:', self.actor_encoder)
 
+        # --- Buffer ---
+        self.target_values = None
+
+    @property
+    def action_dim(self):
+        return self.env.num_act
+
+    @property
+    def env(self) -> WarpEnv:
+        if self._env is None:
+            raise ValueError("Environment not yet set up.")
+        return self._env
+
+    @env.setter
+    def env(self, env):
+        first_setup = self._env is None
+        self._env = env
+        if first_setup:
+            self.__init_post_set_env()
+
+    @property
+    def num_actors(self):
+        return self.env.num_envs
+
+    @property
+    def horizon_len(self):
+        return self.env.num_frames
+
+    def __init_post_set_env(self):
+        """Perform all the setup steps that were in __init__ previously but can only be done once the environment is set up."""
+        self.num_envs = self.env.num_envs
+        self.num_obs = self.env.num_obs
+
+        self.observation_space = self.env.observation_space
+        try:
+            obs_space = {k: v.shape for k, v in self.observation_space.spaces.items()}
+        except AttributeError:
+            obs_space = {'obs': self.observation_space.shape}
+        self.obs_space = obs_space
+
+        self.metrics = self._create_metrics(self.tracker_len, self.metrics_kwargs)
+
+        # --- Normalizers ---
+        if self.tanh_clamp:  # legacy
+            # unbiased=False -> correction=0
+            # https://github.com/NVlabs/DiffRL/blob/a4c0dd1696d3c3b885ce85a3cb64370b580cb913/utils/running_mean_std.py#L34
+            rms_config = dict(eps=1e-5, correction=0, initial_count=1e-4, dtype=torch.float32)
+        else:
+            rms_config = dict(eps=1e-5, initial_count=1, dtype=torch.float64)
+
+        if self.normalize_input:
+            self.obs_rms = {}
+            for k, v in self.obs_space.items():
+                if re.match(self.obs_rms_keys, k):
+                    self.obs_rms[k] = normalizers.RunningMeanStd(v, **rms_config)
+                else:
+                    self.obs_rms[k] = normalizers.Identity()
+            self.obs_rms = nn.ModuleDict(self.obs_rms).to(self.device)
+        else:
+            self.obs_rms = None
+
         # --- Model ---
         if self.network_config.get("encoder", None) is not None:
             obs_dim = self.encoder.out_dim
@@ -117,11 +152,13 @@ class SHAC(Agent):
             obs_dim = self.obs_space['obs']
             obs_dim = obs_dim[0] if isinstance(obs_dim, tuple) else obs_dim
             assert obs_dim == self.env.num_obs
-            assert self.action_dim == self.env.num_actions
 
         ActorCls = getattr(models, self.network_config.actor)
         CriticCls = getattr(models, self.network_config.critic)
-        self.actor = ActorCls(obs_dim, self.action_dim, **self.network_config.get("actor_kwargs", {}))
+        if self.action_dim == 0:
+            self.actor = ActorCls(0, 0, mlp_kwargs={'units': [0]})
+        else:
+            self.actor = ActorCls(obs_dim, self.action_dim, **self.network_config.get("actor_kwargs", {}))
         self.critic = CriticCls(obs_dim, self.action_dim, **self.network_config.get("critic_kwargs", {}))
         self.actor.to(self.device)
         self.critic.to(self.device)
@@ -148,8 +185,6 @@ class SHAC(Agent):
             critic_optim_params,
             **self.shac_config.get("critic_optim_kwargs", {}),
         )
-        print('Actor Optim:', self.actor_optim)
-        print('Critic Optim:', self.critic_optim, '\n')
 
         # TODO: encoder_lr? currently overridden by actor_lr
         self.actor_lr = self.actor_optim.defaults["lr"]
@@ -164,11 +199,6 @@ class SHAC(Agent):
         # --- Target Networks ---
         self.encoder_target = deepcopy(self.encoder) if not self.shac_config.no_target_critic else self.encoder
         self.critic_target = deepcopy(self.critic) if not self.shac_config.no_target_critic else self.critic
-
-        # --- Replay Buffer ---
-        assert self.num_actors == self.env.num_envs
-        T, B = self.horizon_len, self.num_envs
-        self.create_buffers(T, B)
 
         self.reward_shaper = RewardShaper(**self.shac_config.reward_shaper)
 
@@ -206,27 +236,24 @@ class SHAC(Agent):
         # --- Timing ---
         self.timer = Timer()
 
-    def create_buffers(self, T, B):
-        self.obs_buf = {k: torch.zeros((T, B) + v, dtype=torch.float32, device=self.device) for k, v in self.obs_space.items()}
-        self.action_buf = torch.zeros((T, B, self.action_dim), dtype=torch.float32, device=self.device)
-        self.rew_buf = torch.zeros((T, B), dtype=torch.float32, device=self.device)
-        self.done_mask = torch.zeros((T, B), dtype=torch.float32, device=self.device)
-        self.next_values = torch.zeros((T, B), dtype=torch.float32, device=self.device)
-        self.avg_next_values = torch.zeros((T, B), dtype=torch.float32, device=self.device)
-        self.target_values = torch.zeros((T, B), dtype=torch.float32, device=self.device)
-        self.ret = torch.zeros((B), dtype=torch.float32, device=self.device)
+    def _init_target_values(self, trajectory: RolloutTrajectory):
+        """If this buffer was not created before or we changed the horizon lenght, reinitialize."""
+        if self.target_values is None or self.target_values.shape[0] != len(trajectory):
+            self.target_values = torch.zeros((len(trajectory), self.env.num_envs), device=self.device, dtype=torch.float32)
 
-        # for kl divergence computing
-        self.mus = torch.zeros((T, B, self.num_actions), dtype=torch.float32, device=self.device)
-        self.sigmas = torch.zeros((T, B, self.num_actions), dtype=torch.float32, device=self.device)
-        if self.with_logprobs:
-            self.logprobs = torch.zeros((T, B), dtype=torch.float32, device=self.device)
-            self.distr_ent = torch.zeros((T, B), dtype=torch.float32, device=self.device)
+    def get_actions(self,
+                    obs,
+                    sample=True,
+                    dist=False):
+        """
+        Retrieve an action based on the observation.
 
-    def get_actions(self, obs, z=None, sample=True, dist=False):
+        :param obs: The observation to use for action selection.
+        :param sample: Whether to sample from the action distribution or use the mean (greedy).
+        :param dist: Whether to return the action distribution. If false, just returns the action
+        """
         # NOTE: obs_rms.normalize(...) occurs elsewhere
-        if z is None:
-            z = self.actor_encoder(obs)
+        z = self.actor_encoder(obs)
         if self.actor_detach_z:
             if isinstance(z, dict):
                 z = {k: v.detach() for k, v in z.items()}
@@ -289,17 +316,7 @@ class SHAC(Agent):
 
         return episode_rewards_hist, episode_lengths_hist, episode_discounted_rewards_hist
 
-    def initialize_env(self):
-        try:
-            self.env.clear_grad()
-        except Exception as e:
-            print(e)
-            print("Skipping clear_grad")
-        self.env.reset()
-
     def train(self):
-        # initializations
-        self.initialize_env()
 
         while self.agent_steps < self.max_agent_steps:
             self.epoch += 1
@@ -349,10 +366,7 @@ class SHAC(Agent):
             # prepare dataset
             self.timer.start("train/make_critic_dataset")
             with torch.no_grad():
-                if self.entropy_in_targets:
-                    self.compute_target_values_with_entropy()
-                else:
-                    self.compute_target_values()
+                self.compute_target_values()
                 values_results = {
                     "target_values/mean": self.target_values.mean().item(),
                     "target_values/std": self.target_values.std().item(),
@@ -367,7 +381,6 @@ class SHAC(Agent):
             self.encoder.train()
             self.critic.train()
             dataset = CriticDataset(self.critic_batch_size, self.obs_buf, target_values, drop_last=False)
-            self.timer.end("train/make_critic_dataset")
 
             self.timer.start("train/update_critic")
             critic_results = self.update_critic(dataset)
@@ -451,6 +464,7 @@ class SHAC(Agent):
         np.save(open(os.path.join(self.logdir, 'ep_discounted_rewards_hist.npy'), 'wb'), self.episode_discounted_rewards_hist)
 
     def update_actor(self):
+        """Performs an actor update step."""
         results = collections.defaultdict(list)
 
         # zero out just in case
@@ -486,10 +500,6 @@ class SHAC(Agent):
             elif self.with_autoent or self.entropy_coef is not None:  # here entropy is not discounted
                 alpha = self.get_alpha(scalar=True) if self.with_autoent else self.entropy_coef
                 entropy = distr_ents if self.use_distr_ent else -1.0 * logprobs
-                if self.offset_by_target_entropy:
-                    entropy = (entropy + abs(self.target_entropy)) * 0.5
-                if self.scale_by_target_entropy:
-                    entropy = entropy * (1.0 / abs(self.target_entropy))
                 actor_loss = ((alpha * -entropy) - returns).mean()
             else:
                 actor_loss = -returns.mean()
@@ -506,9 +516,7 @@ class SHAC(Agent):
                 # TODO: self.encoder.parameters()
                 grad_norm_before_clip = grad_norm(self.actor.parameters())
                 if self.shac_config.truncate_grads:
-                    if self.shac_config.get("actor_agc_clip", None) is not None:
-                        clip_agc_(self.actor.parameters(), self.shac_config.actor_agc_clip)
-                    elif self.shac_config.get("max_grad_value", None) is not None:
+                    if self.shac_config.get("max_grad_value", None) is not None:
                         nn.utils.clip_grad_value_(self.actor.parameters(), self.shac_config.max_grad_value)
                     elif self.shac_config.max_grad_norm is not None:
                         nn.utils.clip_grad_norm_(self.actor.parameters(), self.shac_config.max_grad_norm)
@@ -562,12 +570,6 @@ class SHAC(Agent):
         if self.with_autoent:
             entropy = self._entropy
             alpha = self.get_alpha(detach=False)
-            if self.unscale_entropy_alpha:
-                if self.offset_by_target_entropy:
-                    pass
-                if self.scale_by_target_entropy:
-                    alpha = alpha * abs(self.target_entropy)
-
             alpha_loss = (alpha * (entropy - self.target_entropy).detach()).mean()
             self.alpha_optim.zero_grad()
             alpha_loss.backward()
@@ -663,33 +665,8 @@ class SHAC(Agent):
                 terminal_obs = extra_info['obs_before_reset']
                 terminal_obs = self._convert_obs(terminal_obs)
 
-                for id in done_env_ids:
-                    nan = False
-                    # TODO: some elements of obs_dict (for logging) may be nan, add regex to ignore these
-                    for k, v in terminal_obs.items():
-                        if (
-                            (torch.isnan(v[id]).sum() > 0)
-                            or (torch.isinf(v[id]).sum() > 0)
-                            or ((torch.abs(v[id]) > 1e6).sum() > 0)
-                        ):  # ugly fix for nan values
-                            print(f'nan value: {k}')
-                            nan = True
-                            break
-                    if nan:
-                        next_values[i + 1, id] = 0.0
-                        avg_next_values[i + 1, id] = 0.0
-                    elif self.episode_lengths[id] < self.max_episode_length:  # early termination
-                        next_values[i + 1, id] = 0.0
-                        avg_next_values[i + 1, id] = 0.0
-                    else:  # otherwise, use terminal value critic to estimate the long-term performance
-                        real_obs = {k: v[id.reshape(1)] for k, v in terminal_obs.items()}
-                        if self.obs_rms is not None:
-                            real_obs = {k: obs_rms[k].normalize(v) for k, v in real_obs.items()}
-                        real_z_target = self.encoder_target(real_obs)
-                        real_next_values, avg_real_next_values = self.critic_target(real_z_target, return_type="min_and_avg")
-                        real_next_values, avg_real_next_values = real_next_values.squeeze(-1), avg_real_next_values.squeeze(-1)
-                        next_values[i + 1, id] = real_next_values
-                        avg_next_values[i + 1, id] = avg_real_next_values
+                for env_id in done_env_ids:
+                    self.get_next_values(env_id)  # TODO: deprecated
 
             if (next_values[i + 1] > 1e6).sum() > 0 or (next_values[i + 1] < -1e6).sum() > 0:
                 print('next value error')
@@ -706,10 +683,6 @@ class SHAC(Agent):
                 # operations to entropy should be out of place since cloning them further below
                 entropy = distr_ent if self.use_distr_ent else -1.0 * logprob
                 entropy = entropy.clone()
-                if self.offset_by_target_entropy:
-                    entropy = (entropy + abs(self.target_entropy)) * 0.5
-                if self.scale_by_target_entropy:
-                    entropy = entropy * (1.0 / abs(self.target_entropy))
                 rew_acc[i + 1, :] = rew_acc[i, :] + gamma * (rew + alpha * entropy)
             else:
                 rew_acc[i + 1, :] = rew_acc[i, :] + gamma * rew
@@ -770,6 +743,19 @@ class SHAC(Agent):
         self.agent_steps += self.horizon_len * self.num_envs
         return returns, logprobs, distr_ents
 
+    def get_next_values(self, trajectory: RolloutTrajectory):
+        """Get the next values for states si for all observations in the trajectory."""
+        if False:  # TODO: This should check for early termination. In this case the next value is 0, not the critic value
+            values = 0.0
+            avg_values = 0.0
+        else:  # Use terminal value critic to estimate the long-term performance
+            obs = trajectory.observations_tensor
+            if self.obs_rms is not None:
+                obs = obs  # TODO: normalize obs
+            z_target = self.encoder_target(obs)
+            values, avg_values = self.critic_target(z_target, return_type="min_and_avg")
+        return values.squeeze(-1), avg_values.squeeze(-1)
+
     def update_critic(self, dataset):
         results = collections.defaultdict(list)
         j = 0
@@ -794,9 +780,7 @@ class SHAC(Agent):
                     # TODO: self.encoder.parameters()
                     grad_norm_before_clip = grad_norm(self.critic.parameters())
                     grad_norms_before_clip.append(grad_norm_before_clip)
-                    if self.shac_config.get("critic_agc_clip", None) is not None:
-                        clip_agc_(self.critic.parameters(), self.shac_config.critic_agc_clip)
-                    elif self.shac_config.get("max_grad_value", None) is not None:
+                    if self.shac_config.get("max_grad_value", None) is not None:
                         nn.utils.clip_grad_value_(self.critic.parameters(), self.shac_config.max_grad_value)
                     elif self.shac_config.max_grad_norm is not None:
                         nn.utils.clip_grad_norm_(self.critic.parameters(), self.shac_config.max_grad_norm)
@@ -811,8 +795,6 @@ class SHAC(Agent):
             results["grad_norm_before_clip/critic"].append(torch.mean(torch.stack(grad_norms_before_clip)))
             results["grad_norm_after_clip/critic"].append(torch.mean(torch.stack(grad_norms_after_clip)))
 
-        #     print(f'value iter {j+1}/{self.critic_iterations}, value_loss= {value_loss.item():7.6f}', end='\r')
-        # print()
         return results
 
     def compute_critic_loss(self, obs, target_v, mean=True, reduction='mean'):
@@ -823,44 +805,42 @@ class SHAC(Agent):
             critic_loss = critic_loss.mean()
         return critic_loss
 
-    def compute_target_values(self):
+    def compute_target_values(self,
+                              trajectory: RolloutTrajectory,
+                              next_values: torch.Tensor,
+                              alpha: Optional[float] = None,
+                              entropy: Optional[torch.Tensor] = None):
+        """
+        Adapted td-lambda target value computation according to SAPO (20). (soft value-bootstrapped k returns).
+
+        Instead of a common td-lambda target value, we compute the target value as a weighted sum of the traditional
+        td-lambda and a monte-carlo estimate of the return. The Monte-Carlo estimate has a high variance, esp. in
+        case of sparse rewards, whereas a td-estimate is biased. The closer we are to the end of the episode (a
+        potential terminal reward), the more we rely on the monte carlo estimate (this means a high lam).
+
+        :param alpha:
+        :param entropy:
+        :return:
+        """
+        self._init_target_values(trajectory)
+        entropy = entropy if entropy is not None else torch.zeros(len(trajectory), self.num_envs, dtype=torch.float32,
+                                                                  device=self.device)
+        alpha = alpha if alpha is not None else 0.
+        rewards = trajectory.rewards_tensor
+        dones = (trajectory.terminated_tensor | trajectory.truncated_tensor).to(torch.int8)
         if self.critic_method == 'one-step':
-            self.target_values = self.rew_buf + self.gamma * self.next_values
+            self.target_values = (rewards + alpha * entropy) + self.gamma * next_values
         elif self.critic_method == 'td-lambda':
-            Ai = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
-            Bi = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
+            td_bootstrapped = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
+            monte_carlo_estimates = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
             lam = torch.ones(self.num_envs, dtype=torch.float32, device=self.device)
-            for i in reversed(range(self.horizon_len)):
-                lam = lam * self.lam * (1.0 - self.done_mask[i]) + self.done_mask[i]
-                adjusted_rew = (1.0 - lam) / (1.0 - self.lam) * self.rew_buf[i]
-                Ai = (1.0 - self.done_mask[i]) * (self.lam * self.gamma * Ai + self.gamma * self.next_values[i] + adjusted_rew)
-                Bi = self.gamma * (self.next_values[i] * self.done_mask[i] + Bi * (1.0 - self.done_mask[i])) + self.rew_buf[i]
-                self.target_values[i] = (1.0 - self.lam) * Ai + lam * Bi
-        else:
-            raise NotImplementedError(self.critic_method)
-
-    def compute_target_values_with_entropy(self):
-        entropy = self.distr_ent if self.use_distr_ent else -1.0 * self.logprobs
-        if self.offset_by_target_entropy:
-            entropy = (entropy + abs(self.target_entropy)) * 0.5
-        if self.scale_by_target_entropy:
-            entropy = entropy * (1.0 / abs(self.target_entropy))
-
-        alpha = self.get_alpha(scalar=True) if self.with_autoent else self.entropy_coef
-
-        if self.critic_method == 'one-step':
-            self.target_values = (self.rew_buf + alpha * entropy) + self.gamma * self.next_values
-        elif self.critic_method == 'td-lambda':
-            Ai = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
-            Bi = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
-            lam = torch.ones(self.num_envs, dtype=torch.float32, device=self.device)
-            for i in reversed(range(self.horizon_len)):
-                lam = lam * self.lam * (1.0 - self.done_mask[i]) + self.done_mask[i]
-                rew = self.rew_buf[i] + alpha * entropy[i]
-                adjusted_rew = (1.0 - lam) / (1.0 - self.lam) * rew
-                Ai = (1.0 - self.done_mask[i]) * (self.lam * self.gamma * Ai + self.gamma * self.next_values[i] + adjusted_rew)
-                Bi = self.gamma * (self.next_values[i] * self.done_mask[i] + Bi * (1.0 - self.done_mask[i])) + rew
-                self.target_values[i] = (1.0 - self.lam) * Ai + lam * Bi
+            for i in reversed(range(len(trajectory))):
+                lam = lam * self.lam * (1.0 - dones[i]) + dones[i]
+                reward_w_entropy = rewards[i] + alpha * entropy[i]
+                adjusted_rew = (1.0 - lam) / (1.0 - self.lam) * reward_w_entropy
+                td_bootstrapped = (1.0 - dones[i]) * (self.lam * self.gamma * td_bootstrapped + self.gamma * next_values[i] + adjusted_rew)
+                monte_carlo_estimates = self.gamma * (next_values[i] * dones[i] + monte_carlo_estimates * (1.0 - dones[i])) + reward_w_entropy
+                self.target_values[i] = (1.0 - self.lam) * td_bootstrapped + lam * monte_carlo_estimates
         else:
             raise NotImplementedError(self.critic_method)
 
