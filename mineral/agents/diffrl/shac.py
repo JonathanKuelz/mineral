@@ -74,15 +74,15 @@ class SHAC(Agent):
             f = lambda x: x
             self.encoder = nets.Lambda(f)
         self.encoder.to(self.device)
-        print('Encoder:', self.encoder)
+        # print('Encoder:', self.encoder)
 
         self.share_encoder = self.shac_config.get("share_encoder", True)
         if self.share_encoder:
             self.actor_encoder = self.encoder
-            print('Actor Encoder: (shared)')
+            # print('Actor Encoder: (shared)')
         else:
             self.actor_encoder = deepcopy(self.encoder)
-            print('Actor Encoder:', self.actor_encoder)
+            # print('Actor Encoder:', self.actor_encoder)
 
         # --- Buffer ---
         self.target_values = None
@@ -162,8 +162,8 @@ class SHAC(Agent):
         self.critic = CriticCls(obs_dim, self.action_dim, **self.network_config.get("critic_kwargs", {}))
         self.actor.to(self.device)
         self.critic.to(self.device)
-        print('Actor:', self.actor)
-        print('Critic:', self.critic, '\n')
+        # print('Actor:', self.actor)
+        # print('Critic:', self.critic, '\n')
 
         # --- Optim ---
         OptimCls = getattr(torch.optim, self.shac_config.optim_type)
