@@ -1,4 +1,5 @@
 import math
+from typing import Any, Dict, Literal
 
 import torch
 import torch.nn as nn
@@ -70,7 +71,8 @@ def weight_init_uniform_(m, fan="avg", scale=1.0, variance_factor=1.0):
 
 
 def weight_init_(module, weight_init):
-    if weight_init == None:
+    """Utility function to initialize weights of a module."""
+    if weight_init is None:
         pass
     elif weight_init == "orthogonal":
         module.apply(weight_init_orthogonal_)
@@ -85,22 +87,36 @@ def weight_init_(module, weight_init):
 
 
 class Actor(nn.Module):
+    """Gaussian Policy"""
+
     def __init__(
         self,
-        state_dim,
-        action_dim,
-        fixed_sigma=True,
-        init_sigma=-1.0,
-        mlp_kwargs=dict(norm_type="LayerNorm", act_type="ELU"),
-        dist_kwargs=dict(dist_type="normal"),
-        weight_init="orthogonal",
-        weight_init_last_layers=False,
+        state_dim: int,
+        action_dim: int,
+        fixed_sigma: bool,
+        init_sigma: float,
+        mlp_kwargs: Dict[str, Any],
+        dist_kwargs: Dict[str, Any],
+        weight_init: Literal['orthogonal', 'orthogonalg1', 'normal', 'dreamerv3_normal'] = "orthogonal",
+        weight_init_last_layers: bool = False,
     ):
+        """
+        A simple Gaussian policy with MLP feature extractor.
+
+        Args:
+            state_dim (int): Dimension of state space.
+            action_dim (int): Dimension of action space.
+            fixed_sigma (bool): Whether to use a fixed standard deviation for the action distribution.
+            init_sigma (float): Initial value for the standard deviation if fixed_sigma is True.
+            mlp_kwargs (Dict[str, Any]): Keyword arguments for the MLP feature extractor.
+            dist_kwargs (Dict[str, Any]): Keyword arguments for the action distribution.
+            weight_init (str): Weight initialization method.
+        """
         super().__init__()
         self.fixed_sigma = fixed_sigma
         self.init_sigma = init_sigma
 
-        self.actor_mlp = MLP(state_dim, **mlp_kwargs)
+        self.actor_mlp = MLP(in_dim=state_dim, out_dim=action_dim, **mlp_kwargs)
         self.mu = nn.Linear(self.actor_mlp.out_dim, action_dim)
         if self.fixed_sigma:
             self.sigma = nn.Parameter(torch.ones(action_dim, dtype=torch.float32), requires_grad=True)
@@ -113,6 +129,8 @@ class Actor(nn.Module):
         self.reset_parameters()
 
     def reset_parameters(self):
+        """Reset the parameters of the network using the specified weight initialization method."""
+
         weight_init_(self, self.weight_init)
 
         if self.fixed_sigma:

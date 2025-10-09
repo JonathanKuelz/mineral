@@ -1,3 +1,5 @@
+from typing import Any, Dict, Literal, Optional, Sequence
+
 import torch
 import torch.nn as nn
 
@@ -23,43 +25,67 @@ def Act(act_type, **act_kwargs):
 
 
 class MLP(nn.Module):
+    """A thin wrapper around nn.Sequential to create an MLP with various options."""
+
     def __init__(
         self,
-        in_dim,
-        out_dim=None,
-        units=[512, 256, 128],
-        dropout=None,
-        dropout_kwargs=dict(inplace=False),
-        where_dropout="every",
-        norm_type=None,
-        norm_kwargs={},
-        act_type="ReLU",
-        act_kwargs=dict(inplace=True),
-        bias=True,
-        plain_last=False,
+        in_dim: int,
+        out_dim: int,
+        hidden_units: Sequence[int],
+        dropout: Optional[float] = None,
+        dropout_kwargs: Optional[Dict[str, Any]] = None,
+        where_dropout: Literal['every', 'first', 'last'] = "every",
+        norm_type = None,
+        norm_kwargs: Optional[Dict[str, Any]] = None,
+        act_type: str = "ReLU",
+        act_kwargs: Optional[Dict[str, Any]] = None,
+        bias: bool = True,
+        plain_last: bool = True,
     ):
+        """
+        Create an MLP with the given specifications.
+
+        Args:
+            in_dim (int): Input dimension.
+            out_dim (int): Output dimension.
+            hidden_units (Sequence[int]): Sizes of hidden layers.
+            dropout (float, optional): Dropout probability. If None, no dropout is applied.
+            dropout_kwargs (dict, optional): Additional arguments for the Dropout layers.
+            where_dropout (str): Where to apply dropout. Options are "every", "first", "last".
+            norm_type (str, optional): Type of normalization layer to use. If None, no normalization is applied.
+            norm_kwargs (dict, optional): Additional arguments for the normalization layers.
+            act_type (str): Type of activation function to use. If None, no activation is applied.
+            act_kwargs (dict, optional): Additional arguments for the activation functions.
+            bias (bool): Whether to include bias terms in the linear layers.
+            plain_last (bool): If True, the last layer will not have activation, normalization, or dropout.
+        """
         super().__init__()
-        if out_dim is not None:
-            units = [*units, out_dim]
+        if norm_kwargs is None:
+            norm_kwargs = {}
+        if act_kwargs is None:
+            act_kwargs = {}
+        if dropout_kwargs is None:
+            dropout_kwargs = {}
+
         self.in_dim = in_dim
-        self.out_dim = units[-1]
-        self.units = units
+        self.out_dim = out_dim
+        self.units = [*hidden_units, out_dim]
 
         in_size = in_dim
         layers = []
-        for i, out_size in enumerate(units):
+        for i, out_size in enumerate(self.units):
             lin = nn.Linear(in_size, out_size, bias=bias)
             layers.append(lin)
-            if plain_last and i == len(units) - 1:
+            if plain_last and i == len(self.units) - 1:
                 break
 
             if dropout is not None:
                 add_dropout = False
                 if i == 0 and where_dropout in ("every", "first"):
                     add_dropout = True
-                if (i != 0 and i != len(units) - 1) and where_dropout in ("every"):
+                if (i != 0 and i != len(self.units) - 1) and where_dropout in ("every",):
                     add_dropout = True
-                if i == len(units) - 1 and where_dropout in ("every", "last"):
+                if i == len(self.units) - 1 and where_dropout in ("every", "last"):
                     add_dropout = True
                 if add_dropout:
                     dp = nn.Dropout(dropout, **dropout_kwargs)
