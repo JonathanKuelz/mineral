@@ -130,25 +130,27 @@ class Actor(nn.Module):
 
     def reset_parameters(self):
         """Reset the parameters of the network using the specified weight initialization method."""
-
         weight_init_(self, self.weight_init)
 
         if self.fixed_sigma:
             nn.init.constant_(self.sigma, self.init_sigma)
-        else:
-            if self.weight_init_last_layers:
-                if self.weight_init == "orthogonal" or self.weight_init == "orthogonalg1":
-                    nn.init.orthogonal_(self.mu.weight, gain=0.01)
+
+        if self.weight_init_last_layers:
+            if self.weight_init == "orthogonal" or self.weight_init == "orthogonalg1":
+                nn.init.orthogonal_(self.mu.weight, gain=0.01)
+                if not self.fixed_sigma:
                     nn.init.orthogonal_(self.sigma.weight, gain=0.01)
                     nn.init.zeros_(self.sigma.bias)
-                elif self.weight_init == "normal":
-                    # nn.init.trunc_normal_(self.mu.weight, std=0.01)
-                    # nn.init.trunc_normal_(self.sigma.weight, std=0.01)
-                    # weight_init_uniform_(self.mu, scale=0.01)
-                    # weight_init_uniform_(self.sigma, scale=0.01)
+            elif self.weight_init == "normal":
+                nn.init.trunc_normal_(self.mu.weight, std=0.01)
+                weight_init_uniform_(self.mu, scale=0.01)
+                if not self.fixed_sigma:
+                    nn.init.trunc_normal_(self.sigma.weight, std=0.01)
+                    weight_init_uniform_(self.sigma, scale=0.01)
                     nn.init.zeros_(self.sigma.bias)
-                elif self.weight_init == "dreamerv3_normal":
-                    dreamerv3_weight_init_trunc_normal_(self.mu, scale=0.01)
+            elif self.weight_init == "dreamerv3_normal":
+                dreamerv3_weight_init_trunc_normal_(self.mu, scale=0.01)
+                if not self.fixed_sigma:
                     dreamerv3_weight_init_trunc_normal_(self.sigma, scale=0.01)
 
     def forward(self, x):
