@@ -99,6 +99,7 @@ class Actor(nn.Module):
         dist_kwargs: Dict[str, Any],
         weight_init: Literal['orthogonal', 'orthogonalg1', 'normal', 'dreamerv3_normal'] = "orthogonal",
         weight_init_last_layers: bool = False,
+        detach_obs: bool = True
     ):
         """
         A simple Gaussian policy with MLP feature extractor.
@@ -111,6 +112,11 @@ class Actor(nn.Module):
             mlp_kwargs (Dict[str, Any]): Keyword arguments for the MLP feature extractor.
             dist_kwargs (Dict[str, Any]): Keyword arguments for the action distribution.
             weight_init (str): Weight initialization method.
+            weight_init_last_layers (bool): Whether to apply special weight initialization to the last layers.
+            detach_obs (bool): Whether to detach observations from the computation graph. If they are NOT detached,
+                then we are implicitly optimizing for "good observations" / "good inputs to the actor", too, and not
+                only for a good trajectory of states. Whether or not to do this is not explicitly discussed in the
+                relevant papers.
         """
         super().__init__()
         self.fixed_sigma = fixed_sigma
@@ -124,6 +130,7 @@ class Actor(nn.Module):
             self.sigma = nn.Linear(self.actor_mlp.out_dim, action_dim)
         self.dist = Dist(**dist_kwargs)
 
+        self.detach_obs = detach_obs
         self.weight_init = weight_init
         self.weight_init_last_layers = weight_init_last_layers
         self.reset_parameters()
@@ -156,6 +163,8 @@ class Actor(nn.Module):
     def forward(self, x):
         if isinstance(x, dict):
             x = x["z"]
+        if self.detach_obs:
+            x = x.detach()
         x = self.actor_mlp(x)
         mu = self.mu(x)
         if self.fixed_sigma:
