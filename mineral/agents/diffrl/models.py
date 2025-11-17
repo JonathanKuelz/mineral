@@ -107,8 +107,8 @@ class Actor(nn.Module):
         Args:
             state_dim (int): Dimension of state space.
             action_dim (int): Dimension of action space.
-            fixed_sigma (bool): Whether to use a fixed standard deviation for the action distribution.
-            init_sigma (float): Initial value for the standard deviation if fixed_sigma is True.
+            fixed_sigma (bool): Whether to use a fixed sigma [logstd] or a state-dependent sigma.
+            init_sigma (float): Initial value for the sigma if fixed_sigma is True.
             mlp_kwargs (Dict[str, Any]): Keyword arguments for the MLP feature extractor.
             dist_kwargs (Dict[str, Any]): Keyword arguments for the action distribution.
             weight_init (str): Weight initialization method.

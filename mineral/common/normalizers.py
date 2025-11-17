@@ -9,6 +9,10 @@ class Identity(nn.Module):
     def update(self, x):
         return
 
+    def update_and_normalize(self, x):
+        """Utility function."""
+        return self.normalize(x)
+
     def normalize(self, x):
         return x
 
@@ -61,6 +65,12 @@ class RunningMeanStd(nn.Module):
         self.running_mean, self.running_var, self.running_count = self._update_from_moments(
             self.running_mean, self.running_var, self.running_count, batch_mean, batch_var, batch_count
         )
+
+    def update_and_normalize(self, x):
+        """Utility function."""
+        with torch.no_grad():
+            self.update(x)
+        return self.normalize(x)
 
     def normalize(self, x):
         x = (x - self.running_mean.float()) / torch.sqrt(self.running_var.float() + self.eps)
