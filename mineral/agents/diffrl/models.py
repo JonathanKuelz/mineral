@@ -168,11 +168,11 @@ class Actor(nn.Module):
         x = self.actor_mlp(x)
         mu = self.mu(x)
         if self.fixed_sigma:
-            sigma = self.sigma
+            logstd = self.sigma
         else:
-            sigma = self.sigma(x)
-        mu, sigma, distr = self.dist(mu, sigma)
-        return mu, sigma, distr
+            logstd = self.sigma(x)
+        mu, std, distr = self.dist(mu, logstd)
+        return mu, std, distr
 
 
 class Critic(nn.Module):

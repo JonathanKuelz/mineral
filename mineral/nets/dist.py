@@ -29,6 +29,14 @@ class Dist(nn.Module):
         self.validate_args = validate_args
 
     def forward(self, mu, logstd):
+        """
+        Take in the mean and log standard deviation, and return the distribution.
+
+        Returns: mu, sigma, distr, where
+            mu: The mean
+            sigma: The standard deviation
+            distr: The distribution object
+        """
         if self.dist_type == 'normal':
             sigma = torch.exp(logstd)
             distr = D.Normal(mu, sigma, validate_args=self.validate_args)
